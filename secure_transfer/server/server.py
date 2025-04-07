@@ -5,8 +5,9 @@ import json
 import sys
 import traceback
 import time
+import ssl
+import hashlib
 
-# Add parent directory to path to import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from encryption import FileEncryptor
 from gdrive import GoogleDriveAPI
@@ -21,11 +22,15 @@ class FileServer:
         self.clients = []
         self.running = False
         
-        # Create upload directory if it doesn't exist
+        # SSL Configuration
+        self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        self.ssl_context.load_cert_chain('server.crt', 'server.key')
+        
+       
         if not os.path.exists(self.upload_dir):
             os.makedirs(self.upload_dir)
         
-        # Initialize Google Drive API if enabled
+       
         self.gdrive = None
         if self.gdrive_enabled:
             try:
@@ -34,6 +39,14 @@ class FileServer:
                 print(f"Failed to initialize Google Drive API: {e}")
                 self.gdrive_enabled = False
     
+    def calculate_checksum(self, file_path):
+        """Calculate SHA256 checksum of a file"""
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8192):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
     def start(self):
         """Start the server"""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -48,10 +61,13 @@ class FileServer:
             while self.running:
                 client, address = self.sock.accept()
                 print(f"Client connected: {address}")
-                self.clients.append(client)
+                
+                # Wrap socket with SSL
+                secure_sock = self.ssl_context.wrap_socket(client, server_side=True)
+                self.clients.append(secure_sock)
                 
                 # Start a new thread to handle the client
-                client_thread = threading.Thread(target=self.handle_client, args=(client, address))
+                client_thread = threading.Thread(target=self.handle_client, args=(secure_sock, address))
                 client_thread.daemon = True
                 client_thread.start()
         except KeyboardInterrupt:
@@ -63,14 +79,14 @@ class FileServer:
         """Stop the server"""
         self.running = False
         
-        # Close all client connections
+      
         for client in self.clients:
             try:
                 client.close()
             except:
                 pass
         
-        # Close the server socket
+       
         if self.sock:
             self.sock.close()
         
@@ -81,7 +97,7 @@ class FileServer:
         try:
             while self.running:
                 try:
-                    # Receive message length first (4 bytes)
+                    
                     msg_len_bytes = client.recv(4)
                     if not msg_len_bytes:
                         print(f"Client {address} disconnected")
@@ -89,7 +105,7 @@ class FileServer:
                     
                     msg_len = int.from_bytes(msg_len_bytes, byteorder='big')
                     
-                    # Receive the message
+                   
                     message = b''
                     bytes_received = 0
                     
@@ -111,7 +127,7 @@ class FileServer:
                         break
                     
                     try:
-                        # Parse message as JSON
+                       
                         message_data = json.loads(message.decode('utf-8'))
                         command = message_data.get('command')
                         
@@ -144,7 +160,7 @@ class FileServer:
                     break
         
         finally:
-            # Remove client from list and close connection
+           
             if client in self.clients:
                 self.clients.remove(client)
             try:
@@ -162,19 +178,19 @@ class FileServer:
             self.send_response(client, {'status': 'error', 'message': 'Missing filename or file_size'})
             return
         
-        # Create a unique filename to avoid conflicts
+       
         base_name = os.path.basename(filename)
         file_path = os.path.join(self.upload_dir, base_name)
         
-        # Send acknowledgment to start receiving file data
+        
         self.send_response(client, {'status': 'ready', 'file_path': file_path})
         
-        # Receive file data
+       
         with open(file_path, 'wb') as f:
             bytes_received = 0
             
             while bytes_received < file_size:
-                # Receive data in chunks
+               
                 chunk_size = min(4096, file_size - bytes_received)
                 chunk = client.recv(chunk_size)
                 
@@ -184,34 +200,38 @@ class FileServer:
                 f.write(chunk)
                 bytes_received += len(chunk)
         
-        # Check if all data was received
+        
+        checksum = self.calculate_checksum(file_path)
+        
+        
         if bytes_received != file_size:
             self.send_response(client, {'status': 'error', 'message': 'Incomplete file transfer'})
             os.remove(file_path)
             return
         
-        # If Google Drive integration is enabled, upload to Google Drive
+       
         gdrive_file_id = None
         if self.gdrive_enabled and self.gdrive:
             try:
-                # Encrypt the file
+                
                 encryptor = FileEncryptor()
                 encrypted_file_path = encryptor.encrypt_file(file_path)
                 
-                # Upload to Google Drive
+                
                 gdrive_file_id = self.gdrive.upload_file(encrypted_file_path)
                 
-                # Delete the encrypted file after upload
+                
                 os.remove(encrypted_file_path)
                 
-                # Delete the original file as well
+                
                 os.remove(file_path)
                 
                 self.send_response(client, {
                     'status': 'success',
                     'message': 'File uploaded to Google Drive',
                     'gdrive_file_id': gdrive_file_id,
-                    'key': encryptor.get_key().hex()  # Send the encryption key to the client
+                    'key': encryptor.get_key().hex(),  
+                    'checksum': checksum  
                 })
             
             except Exception as e:
@@ -220,20 +240,25 @@ class FileServer:
                 self.send_response(client, {'status': 'error', 'message': f'Error uploading to Google Drive: {str(e)}'})
                 return
         else:
-            # Just acknowledge successful upload to server
-            self.send_response(client, {'status': 'success', 'message': 'File uploaded to server'})
+            
+            self.send_response(client, {
+                'status': 'success', 
+                'message': 'File uploaded to server',
+                'checksum': checksum
+            })
     
     def handle_download(self, client, message_data):
         """Handle file download request from client"""
         gdrive_file_id = message_data.get('gdrive_file_id')
         encryption_key = message_data.get('key')
+        client_checksum = message_data.get('checksum')
         
         if not gdrive_file_id:
             self.send_response(client, {'status': 'error', 'message': 'Missing gdrive_file_id'})
             return
         
         try:
-            # Convert hex encryption key to bytes
+            
             if encryption_key:
                 try:
                     key = bytes.fromhex(encryption_key)
@@ -243,24 +268,33 @@ class FileServer:
             else:
                 key = None
             
-            # If Google Drive integration is enabled, download from Google Drive
+          
             if self.gdrive_enabled and self.gdrive:
                 try:
-                    # Download from Google Drive
+                   
                     temp_file_path = os.path.join(self.upload_dir, f"temp_{gdrive_file_id}")
                     self.gdrive.download_file(gdrive_file_id, temp_file_path)
                     
-                    # Get file size
+                    
+                    if client_checksum:
+                        server_checksum = self.calculate_checksum(temp_file_path)
+                        if server_checksum != client_checksum:
+                            os.remove(temp_file_path)
+                            self.send_response(client, {'status': 'error', 'message': 'Checksum mismatch'})
+                            return
+                    
+                    
                     file_size = os.path.getsize(temp_file_path)
                     
-                    # Send file info
+                    
                     self.send_response(client, {
                         'status': 'ready',
                         'file_size': file_size,
-                        'filename': os.path.basename(temp_file_path)
+                        'filename': os.path.basename(temp_file_path),
+                        'checksum': self.calculate_checksum(temp_file_path)
                     })
                     
-                    # Send file data
+                    
                     with open(temp_file_path, 'rb') as f:
                         while True:
                             chunk = f.read(4096)
@@ -268,7 +302,7 @@ class FileServer:
                                 break
                             client.sendall(chunk)
                     
-                    # Delete the temporary file
+                    
                     os.remove(temp_file_path)
                     
                     self.send_response(client, {'status': 'success', 'message': 'File downloaded from Google Drive'})
@@ -302,18 +336,18 @@ class FileServer:
     def send_response(self, client, response_data):
         """Send a response to the client with retry"""
         max_retries = 3
-        retry_delay = 1  # seconds
+        retry_delay = 1  
         
         for attempt in range(max_retries):
             try:
                 response_json = json.dumps(response_data)
                 response_bytes = response_json.encode('utf-8')
                 
-                # Send message length first
+                
                 msg_len = len(response_bytes)
                 client.sendall(msg_len.to_bytes(4, byteorder='big'))
                 
-                # Send the message
+                
                 client.sendall(response_bytes)
                 return True
             
@@ -332,4 +366,4 @@ class FileServer:
 
 if __name__ == "__main__":
     server = FileServer()
-    server.start() 
+    server.start()
