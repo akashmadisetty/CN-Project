@@ -4,8 +4,9 @@ import json
 import sys
 import traceback
 import time
+import ssl
+import hashlib
 
-# Add parent directory to path to import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from encryption import FileEncryptor
 
@@ -17,16 +18,28 @@ class FileClient:
         self.sock = None
         self.connected = False
         self.gdrive_files = []
-        self.saved_keys = {}  # Store file_id -> encryption key mapping
+        self.saved_keys = {}  
         
-        # Create download directory if it doesn't exist
+        # SSL 
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.load_verify_locations('server.crt')
+        
+        
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
     
+    def calculate_checksum(self, file_path):
+        """Calculate SHA256 checksum of a file"""
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8192):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
     def connect(self):
         """Connect to the server with retry"""
         max_retries = 3
-        retry_delay = 1  # seconds
+        retry_delay = 1  
         
         for attempt in range(max_retries):
             try:
@@ -36,8 +49,15 @@ class FileClient:
                     except:
                         pass
                 
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(30)  # 30 second timeout
+                
+                plain_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                plain_sock.settimeout(30)
+                
+                
+                self.sock = self.ssl_context.wrap_socket(
+                    plain_sock,
+                    server_hostname=self.host
+                )
                 self.sock.connect((self.host, self.port))
                 self.connected = True
                 print(f"Connected to server at {self.host}:{self.port}")
@@ -78,22 +98,22 @@ class FileClient:
                 return None
         
         max_retries = 3
-        retry_delay = 1  # seconds
+        retry_delay = 1  
         
         for attempt in range(max_retries):
             try:
-                # Convert message to JSON
+                
                 message_json = json.dumps(message_data)
                 message_bytes = message_json.encode('utf-8')
                 
-                # Send message length first
+                
                 msg_len = len(message_bytes)
                 self.sock.sendall(msg_len.to_bytes(4, byteorder='big'))
                 
-                # Send the message
+
                 self.sock.sendall(message_bytes)
                 
-                # Receive the response
+                
                 return self.receive_response()
             
             except ConnectionError as e:
@@ -116,14 +136,14 @@ class FileClient:
     def receive_response(self):
         """Receive a response from the server with timeout"""
         try:
-            # Receive message length first (4 bytes)
+            
             msg_len_bytes = self.sock.recv(4)
             if not msg_len_bytes:
                 raise ConnectionError("Connection closed by server")
             
             msg_len = int.from_bytes(msg_len_bytes, byteorder='big')
             
-            # Receive the message
+            
             message = b''
             bytes_received = 0
             
@@ -141,7 +161,7 @@ class FileClient:
             if not message:
                 raise ConnectionError("Empty response received")
             
-            # Parse message as JSON
+            
             response_data = json.loads(message.decode('utf-8'))
             return response_data
         
@@ -158,12 +178,14 @@ class FileClient:
             return False
         
         file_size = os.path.getsize(file_path)
+        checksum = self.calculate_checksum(file_path)
         
-        # Send upload request
+        
         response = self.send_message({
             'command': 'upload',
             'filename': os.path.basename(file_path),
-            'file_size': file_size
+            'file_size': file_size,
+            'checksum': checksum
         })
         
         if not response or response.get('status') != 'ready':
@@ -171,7 +193,7 @@ class FileClient:
             return False
         
         try:
-            # Send file data
+            
             with open(file_path, 'rb') as f:
                 while True:
                     chunk = f.read(4096)
@@ -179,7 +201,7 @@ class FileClient:
                         break
                     self.sock.sendall(chunk)
             
-            # Receive upload confirmation
+
             response = self.receive_response()
             
             if not response or response.get('status') != 'success':
@@ -188,7 +210,11 @@ class FileClient:
             
             print(f"Upload successful: {response.get('message')}")
             
-            # Save the encryption key if provided
+            
+            if 'checksum' in response and response['checksum'] != checksum:
+                print("Warning: Server checksum doesn't match local checksum")
+            
+            
             if 'gdrive_file_id' in response and 'key' in response:
                 self.saved_keys[response['gdrive_file_id']] = response['key']
                 print(f"Saved encryption key for file ID: {response['gdrive_file_id']}")
@@ -207,16 +233,17 @@ class FileClient:
             print("Missing Google Drive file ID")
             return False
         
-        # Look up the encryption key for this file ID
+        
         encryption_key = self.saved_keys.get(gdrive_file_id)
         if not encryption_key:
             print("Warning: No encryption key found for this file")
         
-        # Send download request
+        
         response = self.send_message({
             'command': 'download',
             'gdrive_file_id': gdrive_file_id,
-            'key': encryption_key
+            'key': encryption_key,
+            'checksum': self.saved_keys.get(gdrive_file_id + '_checksum') if encryption_key else None
         })
         
         if not response or response.get('status') != 'ready':
@@ -226,26 +253,26 @@ class FileClient:
         try:
             file_size = response.get('file_size')
             filename = response.get('filename')
+            server_checksum = response.get('checksum')
             
-            # Create a temporary file for the encrypted data
+            
             temp_path = os.path.join(self.download_dir, f"temp_{filename}")
             
             if not output_path:
-                # Remove .enc extension if present, keeping the original extension
                 if filename.endswith('.enc'):
-                    original_filename = filename[:-4]  # Remove .enc
+                    original_filename = filename[:-4]  
                 else:
                     original_filename = filename
                 output_path = os.path.join(self.download_dir, original_filename)
             
             print(f"Downloading {os.path.basename(output_path)}...")
             
-            # Receive file data into temporary file
+            
             with open(temp_path, 'wb') as f:
                 bytes_received = 0
                 
                 while bytes_received < file_size:
-                    # Receive data in chunks
+                    # data in chunks
                     chunk_size = min(4096, file_size - bytes_received)
                     chunk = self.sock.recv(chunk_size)
                     
@@ -255,14 +282,22 @@ class FileClient:
                     f.write(chunk)
                     bytes_received += len(chunk)
             
-            # Check if all data was received
+            
             if bytes_received != file_size:
                 print("Incomplete file transfer")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
                 return False
             
-            # Receive download confirmation
+
+            if server_checksum:
+                local_checksum = self.calculate_checksum(temp_path)
+                if local_checksum != server_checksum:
+                    print("Checksum verification failed - file may be corrupted")
+                    os.remove(temp_path)
+                    return False
+            
+            
             response = self.receive_response()
             
             if not response or response.get('status') != 'success':
@@ -271,18 +306,24 @@ class FileClient:
                     os.remove(temp_path)
                 return False
             
-            # If we have the encryption key, decrypt the file
+
             if encryption_key:
                 try:
                     print("Decrypting file...")
-                    # Create decryptor with the saved key
+
                     decryptor = FileEncryptor(encryption_key)
                     
-                    # Decrypt the file
+
                     decryptor.decrypt_file(temp_path, output_path)
                     
-                    # Remove the temporary encrypted file
+                    
                     os.remove(temp_path)
+                    
+
+                    if 'checksum' in response:
+                        decrypted_checksum = self.calculate_checksum(output_path)
+                        if decrypted_checksum != response['checksum']:
+                            print("Warning: Decrypted file checksum doesn't match expected checksum")
                     
                     print(f"Successfully downloaded and decrypted: {output_path}")
                 except Exception as e:
@@ -293,7 +334,7 @@ class FileClient:
                         os.remove(output_path)
                     return False
             else:
-                # If we don't have the key, just move the encrypted file
+                
                 os.rename(temp_path, output_path)
                 print(f"Warning: No encryption key found. File remains encrypted: {output_path}")
             
@@ -350,4 +391,4 @@ class FileClient:
 
 if __name__ == "__main__":
     client = FileClient()
-    client.connect() 
+    client.connect()
