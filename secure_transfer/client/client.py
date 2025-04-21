@@ -8,7 +8,7 @@ import ssl
 import hashlib
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from encryption import FileEncryptor
+from server.encryption import FileEncryptor
 
 class FileClient:
     def __init__(self, host='localhost', port=5000, download_dir='downloads'):

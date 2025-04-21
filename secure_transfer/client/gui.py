@@ -13,8 +13,8 @@ from PyQt5.QtGui import QIcon, QFont, QColor
 
 # Add parent directory to path to import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from client.client import FileClient
-from encryption import FileEncryptor
+from client import FileClient
+from server.encryption import FileEncryptor
 
 class UploadWorker(QThread):
     """Worker thread for uploading files"""
