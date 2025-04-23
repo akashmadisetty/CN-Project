@@ -47,6 +47,7 @@ This project implements a secure cloud-based file storage system where clients c
    openssl req -x509 -newkey rsa:4096 -keyout Server.key -out Server.crt -days 365 -nodes
    ```
 4. Refer to CN Project Documentation.pdf for detailed explanation
+5. Ensure that you have RSA Key, Certificate and have a valid Credentials.json file 
 
 ## Usage
 
